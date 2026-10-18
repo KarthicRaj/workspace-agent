@@ -1,0 +1,415 @@
+"""Module 7 Lab — Agent Harnesses & Skills (ANSWERS).
+
+Five exercises that take apart the harness layer:
+
+  1. Build the minimal harness  (build_bare_agent)
+  2. Measure the context tax    (measure_context_tax, load_skills_lazily)
+  3. Author a portable skill    (skills/dataset-profiler/SKILL.md)
+  4. Verified NVIDIA skill, real GPU (run_gpu_task)
+  5. The self-evolving harness  (self_evolve_skill)
+
+Run a single exercise:  python harness_lab.answers.py --exercise 1
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import time
+from pathlib import Path
+
+import tiktoken
+from dotenv import load_dotenv
+from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool
+from langchain_core.utils.function_calling import convert_to_openai_tool
+from langchain_nvidia_ai_endpoints import ChatNVIDIA
+
+# __file__ exists for `python harness_lab.answers.py`; the notebook falls back
+# to its own directory (Jupyter kernels start in the notebook's folder).
+LAB_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd().resolve()
+SKILLS_DIR = LAB_DIR / "skills"
+TEST_DATA = LAB_DIR / "test_data" / "sensor_readings.csv"
+REPO_ROOT = LAB_DIR.parents[1]
+
+# The Secrets Manager persists keys to <repo>/secrets.env — load them here so
+# terminal runs and notebook kernels both see NVIDIA_API_KEY.
+load_dotenv(REPO_ROOT / "variables.env")
+import sys
+sys.path.insert(0, str(REPO_ROOT / "code"))
+sys.path.insert(0, str(LAB_DIR))
+from workshop_support import get_model, load_secrets
+load_secrets(REPO_ROOT)
+MODEL_NAME = get_model("chat")
+
+
+def ensure_test_data():
+    """Exercises 3-5 profile/aggregate this CSV; generate it on first use."""
+    if not TEST_DATA.exists():
+        subprocess.run(["python", str(LAB_DIR / "scripts" / "make_test_data.py")], check=True)
+
+# ---------------------------------------------------------------------------
+# The minimal harness, pi-style: a short prompt and four tools.
+# ---------------------------------------------------------------------------
+
+MINIMAL_SYSTEM_PROMPT = """You are a capable agent operating a computer through four tools:
+read_file, write_file, edit_file, and run_bash.
+
+Environment: run Python as `python` (the workshop's Python 3.12, with pandas/numpy preinstalled).
+
+Work step by step. Use tools to inspect before you act. When writing code,
+run it to confirm it works. When the task is complete, reply with a short
+summary and no further tool calls."""
+
+
+@tool
+def read_file(path: str) -> str:
+    """Read a text file and return its contents (truncated to 8000 chars)."""
+    try:
+        return Path(path).expanduser().read_text()[:8000]
+    except OSError as exc:
+        return f"ERROR: {exc}"
+
+
+@tool
+def write_file(path: str, content: str) -> str:
+    """Write content to a file, creating parent directories as needed."""
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content)
+    return f"Wrote {len(content)} chars to {target}"
+
+
+@tool
+def edit_file(path: str, old_text: str, new_text: str) -> str:
+    """Replace the first occurrence of old_text with new_text in a file."""
+    target = Path(path).expanduser()
+    text = target.read_text()
+    if old_text not in text:
+        return "ERROR: old_text not found"
+    target.write_text(text.replace(old_text, new_text, 1))
+    return f"Edited {target}"
+
+
+@tool
+def run_bash(command: str) -> str:
+    """Run a shell command and return stdout+stderr (120s timeout)."""
+    proc = subprocess.run(
+        command, shell=True, capture_output=True, text=True, timeout=120
+    )
+    return (proc.stdout + proc.stderr)[-8000:] or f"(exit {proc.returncode})"
+
+
+CORE_TOOLS = [read_file, write_file, edit_file, run_bash]
+TOOL_REGISTRY = {t.name: t for t in CORE_TOOLS}
+
+
+# The harness, not the model, holds the conversation. invoke_with_retry keeps a
+# reference to the live message list so Exercise 5 can review the transcript.
+LAST_RUN_MESSAGES = []
+
+
+def invoke_with_retry(model, messages, attempts=3):
+    """Harnesses own retries (responsibility #4): survive transient API errors."""
+    global LAST_RUN_MESSAGES
+    if isinstance(messages, list):
+        LAST_RUN_MESSAGES = messages
+    for attempt in range(attempts):
+        try:
+            return model.invoke(messages)
+        except Exception:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(2 * (attempt + 1))
+
+
+def tool_call_count(messages=None) -> int:
+    """Tool calls in a recorded run — how hard the harness worked."""
+    msgs = LAST_RUN_MESSAGES if messages is None else messages
+    return sum(len(getattr(m, "tool_calls", None) or []) for m in msgs)
+
+
+def skills_consulted(messages=None) -> list:
+    """Which skills a recorded run load_skill-ed — the Exercise 4/5 receipts."""
+    msgs = LAST_RUN_MESSAGES if messages is None else messages
+    return [
+        call["args"].get("name", "?")
+        for m in msgs
+        for call in (getattr(m, "tool_calls", None) or [])
+        if call["name"] == "load_skill"
+    ]
+
+
+def build_bare_agent(extra_tools=None, system_prompt=MINIMAL_SYSTEM_PROMPT):
+    """Exercise 1: a complete harness in ~20 lines.
+
+    Returns run(task) -> final answer string. The loop: call the model,
+    execute any tool calls, feed results back, repeat until a plain reply.
+    """
+    tools = CORE_TOOLS + list(extra_tools or [])
+    registry = {t.name: t for t in tools}
+    # Two defaults that bite: max_completion_tokens=1024 truncates long
+    # write_file calls mid-JSON, and timeout=60s is too tight for a 120B
+    # model on long generations.
+    model = ChatNVIDIA(
+        model=MODEL_NAME, temperature=0.2, max_completion_tokens=4096, timeout=180
+    ).bind_tools(tools)
+
+    def run(task: str, max_turns: int = 20) -> str:
+        messages = [SystemMessage(content=system_prompt), HumanMessage(content=task)]
+        for _ in range(max_turns):
+            response = invoke_with_retry(model, messages)
+            messages.append(response)
+            if not response.tool_calls:
+                return response.content
+            for call in response.tool_calls:
+                print(f"  🛠️  {call['name']}({json.dumps(call['args'])[:120]})")
+                try:
+                    result = registry[call["name"]].invoke(call["args"])
+                except Exception as exc:
+                    # Harness resilience: a bad tool call becomes an error the
+                    # model can read and correct — the loop never dies on it.
+                    result = f"ERROR: {type(exc).__name__}: {str(exc)[:500]}"
+                messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+        return "ERROR: max turns exceeded"
+
+    return run
+
+
+# ---------------------------------------------------------------------------
+# Exercise 2 — the context tax
+# ---------------------------------------------------------------------------
+
+ENCODER = tiktoken.get_encoding("cl100k_base")
+
+
+def count_tokens(text: str) -> int:
+    return len(ENCODER.encode(text))
+
+
+def harness_overhead(system_prompt: str, tools) -> int:
+    """Tokens a harness pays on EVERY call: prompt + registered tool schemas."""
+    # convert_to_openai_tool() accepts both tool objects and already-converted
+    # dict schemas (LangChain tool objects are NOT callable, so don't callable()-check).
+    schemas = [convert_to_openai_tool(t) for t in tools]
+    return count_tokens(system_prompt) + count_tokens(json.dumps(schemas))
+
+
+def measure_context_tax() -> dict:
+    """Exercise 2a: compare minimal vs maximal per-turn overhead."""
+    maximal_prompt = (LAB_DIR / "maximal_system_prompt.txt").read_text()
+    maximal_tools = json.loads((LAB_DIR / "maximal_tool_schemas.json").read_text())
+
+    minimal = harness_overhead(MINIMAL_SYSTEM_PROMPT, CORE_TOOLS)
+    maximal = harness_overhead(maximal_prompt, maximal_tools)
+
+    print(f"Minimal harness: {minimal:>7,} estimated tokens")
+    print(f"Maximal harness: {maximal:>7,} estimated tokens   ({maximal / minimal:.1f}x tax)")
+    return {"minimal": minimal, "maximal": maximal}
+
+
+from skill_support import parse_frontmatter, skill_target, read_skill_text
+
+
+def load_skills_lazily(skills_dir: Path = SKILLS_DIR):
+    """Exercise 2b: lazy skills — one line of context each, full body on demand.
+
+    Returns (index_text, load_skill_tool). The index goes in the system
+    prompt; the tool lets the model pull in a full skill body when needed.
+    """
+    bodies, index_lines = {}, []
+    for skill_file in sorted(skills_dir.glob("*/SKILL.md")):
+        if skill_file.parent.name.startswith("."):
+            continue
+        text = read_skill_text(skill_file, skills_dir)
+        meta = parse_frontmatter(text)
+        bodies[meta["name"]] = text
+        index_lines.append(f"- {meta['name']}: {meta['description']}")
+
+    index_text = (
+        "Installed skills — before starting a task, load any skill that covers "
+        "it with the load_skill tool and follow its instructions. When in "
+        "doubt, load it:\n"
+        + "\n".join(index_lines)
+    )
+
+    @tool
+    def load_skill(name: str) -> str:
+        """Load the full instructions of an installed skill by name."""
+        return bodies.get(name, f"ERROR: no skill named {name!r}")
+
+    eager = sum(count_tokens(b) for b in bodies.values())
+    lazy = count_tokens(index_text)
+    print(f"{len(bodies)} eager skills: +{eager:,} estimated tokens")
+    print(f"{len(bodies)} lazy skills:  +{lazy:,} estimated tokens   ({eager / max(lazy, 1):.0f}x savings)")
+    return index_text, load_skill
+
+
+# ---------------------------------------------------------------------------
+# Exercise 3 — author a portable skill
+# (answer key: skills/.examples/dataset-profiler/SKILL.md; the exercise is
+#  to write your own at skills/dataset-profiler/SKILL.md and load it below)
+# ---------------------------------------------------------------------------
+
+def run_with_skills(task: str) -> str:
+    """Run the bare agent with the lazy skill index attached."""
+    index_text, load_skill = load_skills_lazily()
+    run = build_bare_agent(
+        extra_tools=[load_skill],
+        system_prompt=MINIMAL_SYSTEM_PROMPT + "\n\n" + index_text,
+    )
+    return run(task)
+
+
+# ---------------------------------------------------------------------------
+# Exercise 4 — verified NVIDIA skill + real GPU
+# ---------------------------------------------------------------------------
+
+def run_gpu_task() -> str:
+    """Aggregate a 1M-row CSV ×10; the cuDF skill — not the task — steers the
+    model to the GPU.
+
+    Install + verify the skill first:
+      bash scripts/install_nvidia_skill.sh accelerated-computing-cudf
+    """
+    if not (SKILLS_DIR / "accelerated-computing-cudf" / "SKILL.md").exists():
+        return "Skill not installed — run scripts/install_nvidia_skill.sh first."
+    ensure_test_data()
+
+    has_gpu = subprocess.run("nvidia-smi", shell=True, capture_output=True).returncode == 0
+    has_cudf = subprocess.run(["python", "-c", "import cudf"], capture_output=True).returncode == 0
+    if not has_gpu:
+        print("⚠️  No GPU detected. Inspect the selected backend; "
+              "ask the agent to use pandas if needed.")
+    elif not has_cudf:
+        print("⚠️  cuDF isn't importable. Check Workshop Health; "
+              "ask the agent to use pandas if needed.")
+
+    # The task asks for speed but never names the GPU — the skill supplies
+    # the how; the receipt below catches the model skipping it.
+    result = run_with_skills(
+        f"Load {TEST_DATA} (about 1M rows) and compute the mean, max, and count "
+        "of `reading` per `device_id`, sorted by mean descending. Repeat the "
+        "full load-and-aggregate 10 times in a loop — don't hoist the CSV read "
+        "out of the loop — and make it fast: use the best-performing DataFrame "
+        "stack available on this machine. Save the final result to "
+        f"{LAB_DIR / 'test_data' / 'aggregates.csv'} and show the top 5 rows."
+    )
+    if "accelerated-computing-cudf" in skills_consulted():
+        return f"{result}\n\n🧾 Receipt: the agent loaded the verified skill before computing."
+    return (f"{result}\n\n🧾 Receipt: the agent never loaded the verified skill "
+            "this run — rerun and watch for load_skill.")
+
+
+# ---------------------------------------------------------------------------
+# Exercise 5 — the self-evolving harness
+# ---------------------------------------------------------------------------
+
+SKILL_AUTHOR_PROMPT = """Review this transcript of an agent completing a task.
+Extract the reusable PROCEDURE (not the task-specific values) and write it as
+an agent skill in exactly this format — output ONLY the file content:
+
+---
+name: <short-hyphenated-name>
+description: <one line stating when this skill should be used>
+---
+
+# <Title>
+
+<numbered procedure the agent should follow next time>
+
+TRANSCRIPT:
+{transcript}"""
+
+
+def format_transcript(messages) -> str:
+    """Flatten a run's message list into the TASK/TOOL/RESULT/ANSWER transcript."""
+    lines = []
+    for msg in messages:
+        if isinstance(msg, SystemMessage):
+            continue
+        if isinstance(msg, HumanMessage):
+            lines.append(f"TASK: {msg.content}")
+        elif isinstance(msg, ToolMessage):
+            lines.append(f"RESULT: {str(msg.content)[:300]}")
+        elif getattr(msg, "tool_calls", None):
+            lines.extend(
+                f"TOOL: {call['name']}({json.dumps(call['args'])[:300]})"
+                for call in msg.tool_calls
+            )
+        elif getattr(msg, "content", None):
+            lines.append(f"ANSWER: {msg.content}")
+    return "\n".join(lines)
+
+
+def self_evolve_skill(transcript: str, skills_dir: Path = SKILLS_DIR) -> Path:
+    """Exercise 5: the agent writes a new skill from its own transcript."""
+    model = ChatNVIDIA(
+        model=MODEL_NAME, temperature=0.2, max_completion_tokens=4096, timeout=180
+    )
+    prompt = SKILL_AUTHOR_PROMPT.format(transcript=transcript)
+    skill_md = invoke_with_retry(model, prompt).content
+    skill_md = skill_md.strip().removeprefix("```markdown").removeprefix("```").removesuffix("```").strip()
+
+    meta = parse_frontmatter(skill_md)  # validate BEFORE saving — a malformed
+    target = skill_target(skills_dir, meta["name"])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(skill_md)
+    print(f"🌱 Agent wrote itself a new skill: {target}")
+    return target
+
+
+def run_self_evolution_demo():
+    task = (
+        f"Check whether the CSV at {TEST_DATA} has any nulls or duplicate "
+        "rows, and report the verdict in one sentence."
+    )
+    ensure_test_data()
+
+    run = build_bare_agent()
+
+    print("=== Run 1 (no skill) ===")
+    print(run(task))
+    run1_calls = tool_call_count()
+    # The agent reviews the REAL transcript of run 1 — every tool call and
+    # result the harness recorded — and distills the reusable procedure.
+    self_evolve_skill(format_transcript(LAST_RUN_MESSAGES))
+
+    print("\n=== Run 2 (with the skill the agent just wrote) ===")
+    print(run_with_skills(task))
+    run2_calls = tool_call_count()
+    loaded = skills_consulted()
+    print(f"\n🧾 Run 1: {run1_calls} tool calls · Run 2: {run2_calls} tool calls "
+          + (f"(consulted: {', '.join(loaded)})" if loaded else "(no skill loaded this run)"))
+
+
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--exercise", type=int, choices=[1, 2, 3, 4, 5], required=True)
+    args = parser.parse_args()
+
+    if args.exercise == 1:
+        run = build_bare_agent()
+        print(run(
+            "Create a file named harness_hello.txt containing the words "
+            "'minimal harness', then read it back and confirm its contents."
+        ))
+    elif args.exercise == 2:
+        measure_context_tax()
+        load_skills_lazily()
+    elif args.exercise == 3:
+        ensure_test_data()
+        print(run_with_skills(
+            f"Profile the dataset at {TEST_DATA} and report your findings."
+        ))
+    elif args.exercise == 4:
+        print(run_gpu_task())
+    elif args.exercise == 5:
+        run_self_evolution_demo()
+
+
+if __name__ == "__main__":
+    main()

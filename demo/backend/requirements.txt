@@ -1,0 +1,17 @@
+deepagents==0.3.11
+fastapi
+uvicorn[standard]
+sse-starlette
+tavily-python
+langchain-nvidia-ai-endpoints==1.4.3
+langchain-community
+langchain==1.3.11
+langchain-core==1.4.8
+langchain-classic
+langchain-text-splitters
+faiss-cpu
+python-dotenv
+# Sandbox support (Docker-based)
+docker
+# Tests: python -m pytest ../../code/5-deep-agents/tests
+pytest

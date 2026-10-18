@@ -1,0 +1,196 @@
+# ref: https://jupyter-app-launcher.readthedocs.io/en/stable/usage.html
+
+- title: "1. Introduction to Agents"
+  description: ""
+  source: http://localhost:$PORT/
+  cwd: "/project/.devx/1-build-an-agent"
+  type: local-server
+  args:
+    - "python"
+    - "-m"
+    - "http.server"
+    - $PORT
+  icon: /project/.devx/_static/img/nvidia-icon.svg
+  catalog: NVIDIA DevX Learning Path
+
+- title: "2. Agentic RAG"
+  description: ""
+  source: http://localhost:$PORT/
+  cwd: "/project/.devx/2-agentic-rag"
+  type: local-server
+  args:
+    - "python"
+    - "-m"
+    - "http.server"
+    - $PORT
+  icon: /project/.devx/_static/img/nvidia-icon.svg
+  catalog: NVIDIA DevX Learning Path
+
+- title: "3. Agent Evaluation"
+  description: ""
+  source: http://localhost:$PORT/
+  cwd: "/project/.devx/3-agent-evaluation"
+  type: local-server
+  args:
+    - "python"
+    - "-m"
+    - "http.server"
+    - $PORT
+  icon: /project/.devx/_static/img/nvidia-icon.svg
+  catalog: NVIDIA DevX Learning Path
+
+- title: "4. Agent Customization"
+  description: ""
+  source: http://localhost:$PORT/
+  cwd: "/project/.devx/4-agent-customization"
+  type: local-server
+  args:
+    - "python"
+    - "-m"
+    - "http.server"
+    - $PORT
+  icon: /project/.devx/_static/img/nvidia-icon.svg
+  catalog: NVIDIA DevX Learning Path
+
+- title: "5. Deep Agents"
+  description: ""
+  source: http://localhost:$PORT/
+  cwd: "/project/.devx/5-deep-agents"
+  type: local-server
+  args:
+    - "python"
+    - "-m"
+    - "http.server"
+    - $PORT
+  icon: /project/.devx/_static/img/nvidia-icon.svg
+  catalog: NVIDIA DevX Learning Path
+
+- title: "6. Agent Safety"
+  description: ""
+  source: http://localhost:$PORT/
+  cwd: "/project/.devx/6-agent-safety"
+  type: local-server
+  args:
+    - "python"
+    - "-m"
+    - "http.server"
+    - $PORT
+  icon: /project/.devx/_static/img/nvidia-icon.svg
+  catalog: NVIDIA DevX Learning Path
+
+- title: "7. Agent Harnesses"
+  description: ""
+  source: http://localhost:$PORT/
+  cwd: "/project/.devx/7-agent-harnesses"
+  type: local-server
+  args:
+    - "python"
+    - "-m"
+    - "http.server"
+    - $PORT
+  icon: /project/.devx/_static/img/nvidia-icon.svg
+  catalog: NVIDIA DevX Learning Path
+
+- title: "Secrets Manager"
+  source: /project/code/secrets_management/secrets_management_master.ipynb
+  cwd: /project
+  args: {}
+  type: notebook-voila
+  icon: /project/.devx/_static/img/key.svg
+  catalog: Workshop Utilities
+
+- title: "Workshop Health"
+  description: "Check your environment, API endpoints, and local services."
+  source: http://localhost:$PORT/
+  cwd: /project/code
+  type: local-server
+  args:
+    - python
+    - -m
+    - workshop_support.health
+    - --port
+    - $PORT
+  icon: /project/.devx/_static/img/health.svg
+  catalog: Workshop Utilities
+
+- title: "Simple Agents Client"
+  source: http://localhost:$PORT/
+  cwd: /project/code/2-agentic-rag
+  type: local-server
+  args:
+    - streamlit
+    - run
+    - simple_client.py
+    - --server.port
+    - $PORT
+  icon: /project/.devx/_static/img/chatbot.svg
+  catalog: NVIDIA DevX Learning Path
+
+- title: "Deep Agents Client"
+  source: http://localhost:$PORT/
+  cwd: /project/demo
+  type: local-server
+  args:
+    - bash
+    - -c
+    - bash /project/demo/start_client.sh $PORT
+  icon: /project/.devx/_static/img/chatbot.svg
+  catalog: NVIDIA DevX Learning Path
+
+- title: "NemoClaw Client"
+  source: http://localhost:$PORT/
+  cwd: /project/code/6-agent-safety
+  type: local-server
+  args:
+    - streamlit
+    - run
+    - nemoclaw_client.py
+    - --server.port
+    - $PORT
+  icon: /project/.devx/_static/img/chatbot.svg
+  catalog: NVIDIA DevX Learning Path
+
+# Coding-assistant tiles. `type: terminal` opens a JupyterLab terminal and sends
+# `source` as the initial command (the frontend appends a carriage return, so it
+# auto-runs). Both CLIs are installed globally by postBuild.bash.
+#
+# `source` runs the CLIs through .devx/bin/start-assistant.sh rather than invoking
+# them bare. Landing on an unexplained TUI told the learner nothing about the tutor
+# skills this repo ships; the wrapper prints an orientation card while they
+# authenticate, and on the first authenticated launch seeds an opening prompt so
+# the tutor introduces itself inside the TUI (where a pre-exec banner would be
+# wiped by a full-screen TUI). It execs the CLI, so signals and resize behave
+# exactly as before. See the header of that script for the full rationale.
+#
+# cwd MUST stay /project: that is what makes this repo's tutor skills load, so a
+# learner can type /workshop or /module-1..7 straight after authenticating.
+# Claude Code reads .claude/skills/, Codex reads .agents/skills/.
+#
+# Deliberately no `args: {reuse: true}` — on a second click reuse reconnects to the
+# existing session but STILL replays the initial command, which would type "claude"
+# into the already-running TUI and submit it as a prompt. Without reuse each click
+# gets a clean session (ClaudeCode1, ClaudeCode2, ...); earlier ones stay reachable
+# from the Running Terminals sidebar.
+#
+# NOTE: this catalog is named to sort AFTER "NVIDIA DevX Learning Path". JupyterLab
+# orders launcher sections alphabetically when no categoryRank is set (which
+# jupyter-app-launcher never sets), so renaming this to something starting before
+# "N" would push these tiles above the learning path.
+
+- title: "Claude Code"
+  description: "Anthropic's agentic CLI, preloaded with this workshop's tutor skills. Authenticate on first run, then use /workshop or /module-1..7 — or just ask."
+  source: "bash /project/.devx/bin/start-assistant.sh claude"
+  cwd: /project
+  type: terminal
+  args: {}
+  icon: /project/.devx/_static/img/claude-icon.svg
+  catalog: Workshop Utilities
+
+- title: "Codex CLI"
+  description: "OpenAI's agentic CLI, preloaded with this workshop's tutor skills. Authenticate on first run, then use $workshop or $module-1..7 — or just ask."
+  source: "bash /project/.devx/bin/start-assistant.sh codex"
+  cwd: /project
+  type: terminal
+  args: {}
+  icon: /project/.devx/_static/img/openai-icon.svg
+  catalog: Workshop Utilities

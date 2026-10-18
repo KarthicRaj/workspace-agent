@@ -1,0 +1,12 @@
+.nvidia-skills-cache/
+test_data/
+harness_hello.txt
+.venv/
+__pycache__/
+# The lab authors and installs skills here under unpredictable names —
+# ignore everything but the shipped examples.
+skills/*
+!skills/README.md
+!skills/code-review/
+!skills/technical-writing/
+!skills/.examples/
